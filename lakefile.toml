@@ -11,8 +11,18 @@ name = "trust"
 git = "https://github.com/chrisflav/trust"
 rev = "master"
 
-# Pinned to the tag that matches this toolchain rather than `main`: `main` is on
-# v4.34.0-rc1, which this package cannot follow (see `TrustServer/Store.lean`).
+# The storage engine.  `leansqlite` publishes a tag per Lean release, and
+# `v4.32.0` is exactly the toolchain this package pins — so the store can be a
+# database without moving `lean-toolchain`, and therefore without moving the
+# `semantic_hash` revision that every certificate hash is computed with.  The
+# SQLite amalgamation is compiled and linked into the binary, so a node needs a
+# C compiler to *build* and nothing at all to *run*.
+[[require]]
+name = "leansqlite"
+git = "https://github.com/leanprover/leansqlite"
+rev = "v4.32.0"
+
+# Pinned to the tag that matches this toolchain rather than `main`.
 [[require]]
 name = "Cli"
 git = "https://github.com/leanprover/lean4-cli"
