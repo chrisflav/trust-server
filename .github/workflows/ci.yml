@@ -1,0 +1,19 @@
+# `lake test` needs gpg: the suite signs with a real key that has a real signing
+# subkey, because the case §3.4 rule 3 is about — an entry naming the subkey's
+# fingerprint rather than the primary's — cannot be reached with a stub.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: gpg --version | head -2
+      - uses: leanprover/lean-action@v1
+        with:
+          test: true
