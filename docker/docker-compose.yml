@@ -1,0 +1,67 @@
+# Bring a node up:
+#
+#   cd docker && docker compose up --build
+#
+# There is no database service.  The store is a directory of append-only logs
+# inside the container, on a named volume — see `TrustServer/Store.lean` for why
+# it is a log rather than SQLite.
+
+services:
+  node:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      TRUST_LOCAL: ${TRUST_LOCAL:-true}
+      NODE_NAME: ${NODE_NAME:-local}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      # Nodes this one talks to, and the token for the endpoints that change
+      # that.  Both empty by default: a node that federates with strangers, or
+      # lets them tell it to, should be something an operator asked for.
+      FEDERATION_SEEDS: ${FEDERATION_SEEDS:-}
+      FEDERATION_AUTODISCOVER: ${FEDERATION_AUTODISCOVER:-false}
+      FEDERATION_ALLOW_PRIVATE: ${FEDERATION_ALLOW_PRIVATE:-false}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      APP_URL: ${APP_URL:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    volumes:
+      - store:/data
+    ports:
+      # Loopback by default.  Behind a reverse proxy this must not be reachable
+      # from outside, or the TLS, the redirects and the security headers can all
+      # be walked straight past.
+      - "${BIND_ADDR:-127.0.0.1}:${PORT:-8099}:8080"
+    restart: unless-stopped
+
+  # A second node, to watch federation actually happen:
+  #
+  #   docker compose --profile federation up --build
+  #
+  # `FEDERATION_ALLOW_PRIVATE` is on because the two reach each other by
+  # container name on a private network, which §5.4 otherwise forbids for good
+  # reason.  It belongs in a demo and nowhere else.
+  peer:
+    profiles: ["federation"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      TRUST_LOCAL: "true"
+      NODE_NAME: peer
+      PUBLIC_URL: http://peer:8080
+      FEDERATION_SEEDS: http://node:8080
+      FEDERATION_ALLOW_PRIVATE: "true"
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-demo}
+    volumes:
+      - peerstore:/data
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${PEER_PORT:-8098}:8080"
+    depends_on:
+      - node
+    restart: unless-stopped
+
+volumes:
+  store:
+  peerstore:
