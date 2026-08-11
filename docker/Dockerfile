@@ -8,6 +8,10 @@
 
 FROM debian:bookworm-slim AS build
 
+# `build-essential` is not only Lean's linker: `leansqlite` compiles the SQLite
+# amalgamation from C and links it into the binary, so the store needs a C
+# compiler here.  It needs nothing in the runtime stage below, because by then
+# SQLite is already inside `trust-server`.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl ca-certificates git build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -43,6 +47,10 @@ FROM debian:bookworm-slim AS runtime
 
 # gpg checks every signature this node believes; curl is how it reaches peers,
 # since Lean has no TLS of its own.  Both are load-bearing, not conveniences.
+#
+# There is deliberately no `libsqlite3` here.  `leansqlite` bundles the SQLite
+# amalgamation and links it statically, so the database engine ships inside the
+# binary and this stage is exactly what it was before the store moved.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       gnupg curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -51,10 +59,12 @@ COPY --from=build /out/trust-server /usr/local/bin/trust-server
 COPY --from=build /out/lib/ /usr/local/lib/trust/
 ENV LD_LIBRARY_PATH=/usr/local/lib/trust
 
-# The store is a directory of append-only logs.  Created here so that a named
-# volume mounted over it inherits this ownership: Docker copies the image's for
-# an empty volume, and a root-owned one would leave the unprivileged process
-# below unable to write its own log.
+# The store is a directory holding one SQLite database.  Created here so that a
+# named volume mounted over it inherits this ownership: Docker copies the
+# image's for an empty volume, and a root-owned one would leave the
+# unprivileged process below unable to write.  The directory matters as much as
+# the file: SQLite puts the write-ahead log beside the database, so a store
+# whose file is writable but whose directory is not cannot commit.
 RUN useradd --system --uid 10001 --home /data trust \
     && mkdir -p /data && chown trust:trust /data
 VOLUME /data

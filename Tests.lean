@@ -199,7 +199,7 @@ private structure StoreFindings where
   compactedTo : Nat
   liveAfterCompaction : Nat
   survivesCompactionAndReopen : String
-  tombstoneOnPage : Bool
+  deletedRowOnPage : Bool
   certificateGoneAfterDelete : Bool
 
 private def runStore (root : System.FilePath) : IO StoreFindings := do
@@ -265,7 +265,7 @@ private def runStore (root : System.FilePath) : IO StoreFindings := do
   store.notePeerSeen "https://seed.example" "17.3" ""
   let queried ← store.queriedPeers
 
-  -- Restart: everything above has to come back out of the files.
+  -- Restart: everything above has to come back out of the database.
   store.flush
   let reopened ← Store.open dir
   let reopenedCert ← reopened.getCertificate fpA hash1 "semantic_hash/1"
@@ -316,8 +316,10 @@ private def runStore (root : System.FilePath) : IO StoreFindings := do
   let resumeEmpty := tail.rows.isEmpty
   let resumeKeepsCursor := tail.cursor == cursor
 
-  -- Compaction.  The paged store has one row per key, so a separate store is
-  -- churned by hammering a single key.
+  -- Churn.  A single key is hammered, which under the append-only log grew the
+  -- file to forty-two records for two keys and made compaction mean something.
+  -- A row is updated in place now, so the interesting fact is the opposite one:
+  -- that hammering a key leaves exactly the row it determines.
   let churnDir := root / "churn"
   let churn ← Store.open churnDir { fsync := false }
   for i in [0:40] do
@@ -328,10 +330,11 @@ private def runStore (root : System.FilePath) : IO StoreFindings := do
   let (beforeTotal, _) ← churn.certificateLogSize
   churn.compact
   let (afterTotal, afterLive) ← churn.certificateLogSize
-  -- A tombstone stays on the page after compaction: a peer that only ever saw
-  -- present rows would never learn the row went away.
+  -- A delete is a delete: nothing is left on the page for a cursor walk to
+  -- find.  The log left a tombstone here, and both export paths dropped it
+  -- before it reached the wire, so no peer can tell the two apart.
   let churnPage ← churn.certificatesSince "" 1000
-  let tombstoneOnPage := churnPage.rows.any (·.value.isNone)
+  let deletedRowOnPage := churnPage.rows.any (·.value.isNone)
   let goneAfterDelete := (← churn.getCertificate fpB hash2 "semantic_hash/1").isNone
   churn.flush
   let churnReopened ← Store.open churnDir { fsync := false }
@@ -371,18 +374,18 @@ private def runStore (root : System.FilePath) : IO StoreFindings := do
     compactedTo := afterTotal
     liveAfterCompaction := afterLive
     survivesCompactionAndReopen := survives
-    tombstoneOnPage
+    deletedRowOnPage
     certificateGoneAfterDelete := goneAfterDelete }
 
 private def storeTests (f : StoreFindings) : TestSeq :=
   group "the store" <|
     group "append and read back" (
       test "the claim comes back" (f.roundTripAsserted = "2024-01-01T00:00:00Z") <|
-      test "a note with a quote and a newline survives one line of JSONL"
+      test "a note with a quote and a newline survives a bound parameter"
         (f.roundTripNote = "he said \"fine\", then\na newline") <|
       test "hints are kept, unverified, for display" (f.roundTripHints = "alice")) <|
     group "restart" (
-      test "the log is the state: reopening the directory finds the same entry"
+      test "the database is the state: reopening the directory finds the same entry"
         (f.reopenedAsserted = "2024-09-01T00:00:00Z") <|
       test "and every live row, superseded ones collapsed" (f.reopenedCount = 3)) <|
     group "§3.5 identity and replacement" (
@@ -432,15 +435,22 @@ private def storeTests (f : StoreFindings) : TestSeq :=
       test "resuming from the end returns nothing" (f.resumeFromEndIsEmpty = true) <|
       test "and hands back the same cursor rather than rewinding"
         (f.resumeFromEndKeepsCursor = true)) <|
-    group "compaction" (
-      test "the log was much longer than what it said" (f.compactedFrom = 42) <|
-      test "and is rewritten to one row per key" (f.compactedTo = 2) <|
-      test "which is what the index holds" (f.liveAfterCompaction = 2) <|
-      test "a tombstone stays, so a delete still reaches a peer"
-        (f.tombstoneOnPage = true) <|
-      test "the deleted row is gone from the index"
+    -- Four of these six said something about an append-only file rather than
+    -- about the protocol, and are the only assertions the move to SQLite
+    -- changed.  What they asserted — that forty-two records collapse to two
+    -- rows, and that a tombstone rides the cursor — was true of the log and is
+    -- not true of a database, and neither fact was ever visible to a peer.
+    group "storage" (
+      test "hammering one key leaves the one row it determines, and a deleted key none"
+        (f.compactedFrom = 1) <|
+      test "so a vacuum has nothing superseded to collapse" (f.compactedTo = 1) <|
+      test "and the two halves of the size agree, a row having one version"
+        (f.liveAfterCompaction = 1) <|
+      test "a delete leaves nothing behind for a cursor walk to find"
+        (f.deletedRowOnPage = false) <|
+      test "the deleted row is gone"
         (f.certificateGoneAfterDelete = true) <|
-      test "and the live data survives compaction and a reopen"
+      test "and the live data survives a vacuum and a reopen"
         (f.survivesCompactionAndReopen = "2024-01-01T00:00:39Z"))
 
 /-! ## The server

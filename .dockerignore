@@ -1,3 +1,5 @@
 .lake
 .git
-*.jsonl
+*.db
+*.db-wal
+*.db-shm

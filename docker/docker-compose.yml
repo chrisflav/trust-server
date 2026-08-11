@@ -2,9 +2,9 @@
 #
 #   cd docker && docker compose up --build
 #
-# There is no database service.  The store is a directory of append-only logs
-# inside the container, on a named volume — see `TrustServer/Store.lean` for why
-# it is a log rather than SQLite.
+# There is no database service.  There is a database — SQLite, linked into the
+# binary — but it is a file on a named volume inside the container rather than
+# something to connect to, so a node is still one container and one volume.
 
 services:
   node:

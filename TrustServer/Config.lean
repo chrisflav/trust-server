@@ -114,9 +114,14 @@ structure ServerConfig where
   published port — which is a confusing way to be safe.
   -/
   bindAll : Bool := false
-  /-- The directory the append-only logs live in. -/
+  /-- The directory the store's SQLite database lives in. -/
   storeDir : String := ""
-  /-- Whether every append is `fdatasync`ed before it returns. -/
+  /--
+  Whether a committed write has reached the platter before it returns.
+
+  On, `PRAGMA synchronous=FULL`; off, `NORMAL`, which survives this process
+  dying but not the machine.  See `TrustServer/Store.lean`.
+  -/
   storeFsync : Bool := true
   sessionSecret : String := ""
   cookieSecure : Bool := false
