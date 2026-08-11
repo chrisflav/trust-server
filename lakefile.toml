@@ -1,0 +1,39 @@
+name = "trust-server"
+version = "0.1.0"
+defaultTargets = ["TrustServer", "trust-server"]
+
+# The core library: `Trust.Cert` carries `Claim`, `Revocation`, `Entry` and
+# `Bundle`, and the canonical bytes a signature is made over.  Restating those
+# types here would be a second implementation of §3.2 to keep honest.
+[[require]]
+name = "trust"
+git = "https://github.com/chrisflav/trust"
+rev = "master"
+
+# Pinned to the tag that matches this toolchain rather than `main`: `main` is on
+# v4.34.0-rc1, which this package cannot follow (see `TrustServer/Store.lean`).
+[[require]]
+name = "Cli"
+git = "https://github.com/leanprover/lean4-cli"
+rev = "v4.32.0"
+
+# `main` is on v4.31.0 and, since the Plausible integration, pulls in a
+# `plausible` that does not compile on v4.32.0 (`Plausible/Testable.lean:383`,
+# application type mismatch).  This is the last revision before that, and it
+# builds here unchanged.
+[[require]]
+name = "LSpec"
+git = "https://github.com/argumentcomputer/LSpec"
+rev = "3e23a4ad2e91eaf07845cecad157b7ffbb437aed"
+
+[[lean_lib]]
+name = "TrustServer"
+
+[[lean_exe]]
+name = "trust-server"
+root = "Main"
+
+[[lean_exe]]
+name = "tests"
+root = "Tests"
+supportInterpreter = true
