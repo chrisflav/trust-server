@@ -104,6 +104,16 @@ structure ServerConfig where
   `«local»` at every use is worse than a field with a longer name.
   -/
   localMode : Bool := false
+  /--
+  Bind every interface rather than loopback.
+
+  Off by default, because a node that is reachable before its operator said so
+  is the wrong default for something that accepts POSTs from strangers.  A
+  container turns it on: there the container boundary is the isolation, and
+  binding loopback inside one makes the node unreachable through its own
+  published port — which is a confusing way to be safe.
+  -/
+  bindAll : Bool := false
   /-- The directory the append-only logs live in. -/
   storeDir : String := ""
   /-- Whether every append is `fdatasync`ed before it returns. -/
@@ -149,6 +159,7 @@ def ofEnv (env : String → Option String) : ServerConfig :=
     appUrl := stripTrailingSlashes (envString env "APP_URL")
     name := envString env "NODE_NAME" (if localMode then "local" else "")
     localMode
+    bindAll := envBool env "TRUST_BIND_ALL" false
     storeDir := envString env "TRUST_STORE_DIR" (defaultStoreDir env)
     storeFsync := envBool env "TRUST_STORE_FSYNC" true
     -- In local mode nothing is exposed and there is nobody to forge a session
@@ -183,7 +194,7 @@ def load : IO ServerConfig := do
   -- missing from it, `ofEnv` will see it as unset, which is the failure mode
   -- that a single list in one place is meant to prevent.
   let names := #[
-    "TRUST_LOCAL", "PORT", "PUBLIC_URL", "APP_URL", "NODE_NAME",
+    "TRUST_LOCAL", "TRUST_BIND_ALL", "PORT", "PUBLIC_URL", "APP_URL", "NODE_NAME",
     "TRUST_STORE_DIR", "TRUST_STORE_FSYNC", "XDG_DATA_HOME", "HOME",
     "SESSION_SECRET", "COOKIE_SECURE", "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET",
     "FEDERATION_SEEDS", "ADMIN_TOKEN",

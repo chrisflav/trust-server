@@ -77,7 +77,8 @@ Start a node: open the store, admit the seeds, learn our own address, serve.
 A seed is the operator's own decision, so it is queried from the start (§5.1)
 rather than waiting to be promoted the way a peer somebody else announced does.
 -/
-def start (config : ServerConfig) (loopbackOnly : Bool := true) : IO Unit := do
+def start (config : ServerConfig) : IO Unit := do
+  let loopbackOnly := !config.bindAll
   let store ← Store.open config.storeDir config.storeOptions
   let (certificates, peers) ← store.counts
   IO.println s!"store {config.storeDir}: {certificates} certificates, {peers} peers queried"
