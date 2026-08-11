@@ -1,5 +1,6 @@
 name = "trust-server"
 version = "0.1.0"
+testDriver = "tests"
 defaultTargets = ["TrustServer", "trust-server"]
 
 # The core library: `Trust.Cert` carries `Claim`, `Revocation`, `Entry` and
