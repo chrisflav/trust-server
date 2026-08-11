@@ -31,13 +31,7 @@ private def runServer (p : Parsed) : IO UInt32 := do
   if !problems.isEmpty then
     for problem in problems do IO.eprintln s!"error: {problem}"
     return 1
-  let store ← Store.open config.storeDir config.storeOptions
-  let (certificates, peers) ← store.counts
-  IO.println s!"store {config.storeDir}: {certificates} certificates, {peers} peers queried"
-  Async.block do
-    let server ← serve config store
-    IO.println s!"listening on http://127.0.0.1:{boundPort server}"
-    server.waitShutdown
+  start config
   return 0
 
 private def serverCmd : Cmd := `[Cli|

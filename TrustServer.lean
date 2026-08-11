@@ -4,75 +4,98 @@ import Std.Async
 import Std.Net
 import TrustServer.Store
 import TrustServer.Config
+import TrustServer.Http
+import TrustServer.Routes
+import TrustServer.Auth
+import TrustServer.Federation.Routes
 
 /-!
-# The server skeleton
+# The node
 
-Deliberately almost empty.  This branch is the store and the configuration; the
-routes, the sessions and the federation belong to other work, and writing a
-half-finished version of them here would only have to be deleted.  What is here
-is the smallest thing that proves the pieces fit together: a configuration read
-from the environment, a store opened on disk, and an HTTP server bound to a port
-and answering.
+The routes, in one list, and the socket they answer on.
 
-`/api/health` is the only route, and it lives here rather than in a routing
-module because there is no routing module yet.  Anything else gets a 404.
+Three paths are claimed twice, and which copy wins is a decision rather than an
+accident.  `TrustServer.Routes` has a local-only `GET /api/certificates`, an
+export, and a descriptor; `TrustServer.Federation.Routes` has the same three
+with §7's delegation, §4.1's peers and §2's real counts.  The federating ones
+supersede, so they go first — and the superseded three are dropped by name
+rather than left to be shadowed, because a route that can never match is a route
+somebody will later change and wonder why nothing happened.
 -/
 
 open Std Std.Http Std.Async Std.Net
 
 namespace TrustServer
 
-
-/-- The path of a request, with the query string dropped. -/
-def requestPath (req : Request Body.Stream) : String := toString req.line.uri.path
-
-/-- A JSON response, since every response this server will ever make is one. -/
-def jsonResponse (builder : Response.Builder) (payload : Lean.Json) :
-    ContextAsync (Response Body.Any) := do
-  let body ← Body.Full.ofString (Lean.Json.compress payload)
-  return builder |>.header! "Content-Type" "application/json" |>.body (Body.Any.ofBody body)
+/-- The three `TrustServer.Routes` entries that `Federation.Routes` supersedes. -/
+def supersededByFederation : Array (Method × String) :=
+  #[(.get, "/api/certificates"), (.get, "/api/certificates/export"), (.get, "/api/federation")]
 
 /--
-The skeleton handler: liveness, and nothing else yet.
+Everything this node answers.
 
-The health answer reports what the store actually holds rather than a constant
-`true`, so that a green health check means the log was opened and indexed and
-not merely that a process is listening.
+Order is first-match, so the federating routes come before the local ones they
+replace.  Sessions come last: none of their paths collide, and reading them at
+the end matches how they are reached — a person signs in, having already found
+the node.
 -/
-def skeletonHandler (config : ServerConfig) (store : Store) : Server.StatelessHandler where
-  onRequest := fun req => do
-    match req.line.method, requestPath req with
-    | .get, "/api/health" =>
-      let (certificates, peers) ← store.counts
-      jsonResponse Response.ok <| Lean.Json.mkObj [
-        ("ok", Lean.Json.bool true),
-        ("name", Lean.Json.str config.name),
-        ("certificates", Lean.toJson certificates),
-        ("peers", Lean.toJson peers)]
-    | _, path =>
-      jsonResponse Response.notFound <| Lean.Json.mkObj [
-        ("error", Lean.Json.str "not found"), ("path", Lean.Json.str path)]
+def allRoutes : Array Route :=
+  Federation.federationRoutes
+    ++ Federation.peerRoutes
+    ++ Routes.certificateRoutes.filter (fun r =>
+         !supersededByFederation.any (fun (m, p) => r.method == m && r.path == p))
+    ++ Auth.sessionRoutes
 
 /--
-Bind, and hand back the running server.
+Bind, and hand back the running node.
 
-The address is taken from the configuration but the *bound* address is read back
-off the server, because a port of `0` means "whichever one is free" and the test
-that talks to this needs to know which one that was.
+The handler reads the `App` out of a ref on every request rather than closing
+over it, because a node has to know its own externally reachable URL — §5.2
+checks an announcement against it and §7.1 puts it in `via` — and when the
+configured port is `0` that is not known until the socket is bound.
 -/
-def serve (config : ServerConfig) (store : Store) (loopbackOnly : Bool := true) :
+def serve (config : ServerConfig) (app : IO.Ref App) (loopbackOnly : Bool := true) :
     Async Server := do
   let addr := SocketAddress.v4 {
     addr := if loopbackOnly then IPv4Addr.ofParts 127 0 0 1 else IPv4Addr.ofParts 0 0 0 0
     port := UInt16.ofNat config.port }
-  Server.serve addr (skeletonHandler config store) config.httpConfig
+  Server.serve addr
+    ({ onRequest := fun req => do (router (← app.get) allRoutes).onRequest req } :
+      Server.StatelessHandler)
+    config.httpConfig
 
-/-- The port the server ended up on, which is only interesting when `port` was 0. -/
+/-- The port the node ended up on, which is only interesting when `port` was 0. -/
 def boundPort (server : Server) : Nat :=
   match server.localAddr with
   | some (.v4 a) => a.port.toNat
   | some (.v6 a) => a.port.toNat
   | none => 0
+
+/--
+Start a node: open the store, admit the seeds, learn our own address, serve.
+
+A seed is the operator's own decision, so it is queried from the start (§5.1)
+rather than waiting to be promoted the way a peer somebody else announced does.
+-/
+def start (config : ServerConfig) (loopbackOnly : Bool := true) : IO Unit := do
+  let store ← Store.open config.storeDir config.storeOptions
+  let (certificates, peers) ← store.counts
+  IO.println s!"store {config.storeDir}: {certificates} certificates, {peers} peers queried"
+  for seed in config.seeds do
+    let _ ← store.putPeer { url := seed, status := .seed }
+  Async.block do
+    let app ← IO.mkRef ({ config, store } : App)
+    let server ← serve config app loopbackOnly
+    let port := boundPort server
+    -- Now that the port is known, say what our own URL is, so that §5.2 can
+    -- refuse an announcement naming anything else and §7.1 can put it in `via`.
+    -- A configured `PUBLIC_URL` always wins: behind a proxy the node's own port
+    -- is not what anybody reaches it by.
+    if config.publicUrl.isEmpty then
+      app.modify fun a =>
+        { a with config := { a.config with publicUrl := s!"http://127.0.0.1:{port}" } }
+    IO.println s!"listening on http://127.0.0.1:{port}"
+    IO.println s!"{allRoutes.size} routes, {if config.localMode then "local mode" else "public"}"
+    server.waitShutdown
 
 end TrustServer
