@@ -1,12 +1,15 @@
 import LSpec
 import TrustServer.Routes
+import TrustServer.Federation.Routes
 
 /-!
 # Tests
 
-Everything here runs against a real directory on disk and, for the last group, a
-real socket.  The store's whole premise is that its state is a file, so a test
-that mocked the file would be testing something else.
+Everything here runs against a real directory on disk and, for the last two
+groups, real sockets.  The store's whole premise is that its state is a file, so
+a test that mocked the file would be testing something else; the federation
+group takes the same line about the network and stands up a second node
+in-process rather than pretending to be one.
 
 The IO happens first and the assertions are made afterwards about what it
 produced, because `LSpec.TestSeq` is a pure value: a failure then reports the
@@ -587,18 +590,23 @@ private def portOf (server : Server) : Nat :=
   | none => 0
 
 /--
-A node, with the routes this branch adds.
+A node, with the routes it is asked to answer on.
 
 Built here rather than taken from `TrustServer.serve`, which still answers with
 the skeleton handler: wiring the router into the server is the orchestrator's
-change, and this is the same `router` over the same two route arrays that it
-will make.
+change, and this is the same `router` that it will make.
+
+The app arrives in a ref rather than as a value because a federating node cannot
+be finished before it is bound — it does not know its own URL until the OS has
+picked a port, and §5.2 and §7.1 both turn on a node knowing its own URL.
 -/
-private def serveRoutes (config : ServerConfig) (store : Store) : Async Server := do
+private def serveRoutes (config : ServerConfig) (app : IO.Ref App) (routes : Array Route) :
+    Async Server := do
   let addr := SocketAddress.v4 {
     addr := IPv4Addr.ofParts 127 0 0 1, port := UInt16.ofNat config.port }
   Server.serve addr
-    (router { config, store } (Routes.certificateRoutes ++ Auth.sessionRoutes))
+    ({ onRequest := fun req => do (router (← app.get) routes).onRequest req } :
+      Server.StatelessHandler)
     config.httpConfig
 
 /-! ### What one run found out -/
@@ -705,9 +713,12 @@ private def runRoutes (root : System.FilePath) : IO RouteFindings := do
     publicStore.putSession { token := staleCookie, id := "ses-2", kind := .browser, login := "bob",
                              expiresMs := (← nowMs) - 1 }
 
+    let oneApp ← IO.mkRef ({ config := localConfig, store := localStore } : App)
+    let twoApp ← IO.mkRef ({ config := publicConfig, store := publicStore } : App)
+    let served := Routes.certificateRoutes ++ Auth.sessionRoutes
     Async.block do
-      let one ← serveRoutes localConfig localStore
-      let two ← serveRoutes publicConfig publicStore
+      let one ← serveRoutes localConfig oneApp served
+      let two ← serveRoutes publicConfig twoApp served
       let p1 := portOf one
       let p2 := portOf two
       let mut f : RouteFindings := {}
@@ -1042,6 +1053,389 @@ private def routeTests (f : RouteFindings) : TestSeq :=
       test "a known path under the wrong method is a 405" (f.wrongMethodStatus = 405) <|
       test "and both nodes shut down rather than hanging" (f.shutDownCleanly = true))
 
+/-! ## Federation
+
+Real nodes, on real sockets, in one process.
+
+Federation is the part of this server that is *about* the other end being
+somebody else, so the peer here is a second node with its own store, its own
+port and its own opinion of the world, and the entries that travel between them
+carry signatures a real `gpg` really made — by a signing subkey, so that §3.4
+rule 5 is exercised across the wire and not only in the route tests.  What is
+left to arrange is only what a test is entitled to arrange: which limits each
+node enforces, and which of them is unreachable.
+-/
+
+/-- The `i`th hash this group asserts about: lower-case hex, as §3.4 rule 1 wants. -/
+private def hashN (i : Nat) : String := s!"abcdef0123456789abcdef012345678{i}"
+
+/-- An entry as it federates: signed over exactly `Claim.canonical`, key and all. -/
+private def signedEntry (home : System.FilePath) (uid : String) (key : TestKey)
+    (hash asserted : String) : IO Trust.Entry := do
+  let claim := claimOf "Foo.bar" hash asserted "he said \"fine\", then\na newline"
+  let signature ← signWith home uid claim.canonical
+  return { claim, signature, key := key.armoredPublic, fingerprint := key.primary }
+
+private structure Node where
+  url : String
+  store : Store
+  app : IO.Ref App
+  server : Server
+
+/--
+A node, listening.
+
+The app goes in a ref because a node cannot be finished before it is bound: it
+does not know its own URL until the OS has picked a port, and §5.2 and §7.1 both
+turn on a node knowing its own URL.  `callsItself` is how a test builds one that
+knows it wrongly.
+-/
+private def startNode (root : System.FilePath) (name : String) (policy : Policy)
+    (routes : Array Route) (adminToken : String := "") (callsItself : String := "") :
+    Async Node := do
+  let store ← Store.open (root / name) { fsync := false }
+  let config : ServerConfig := { port := 0, name, localMode := true, adminToken, policy }
+  let app ← IO.mkRef ({ config, store } : App)
+  let server ← serveRoutes config app routes
+  let url := s!"http://127.0.0.1:{portOf server}"
+  app.set { config := { config with
+    publicUrl := if callsItself.isEmpty then url else callsItself }, store }
+  return { url, store, app, server }
+
+/-- A node from another protocol generation: honest, and unintelligible (§2). -/
+private def foreignDescriptorRoute : Route where
+  method := .get
+  path := "/api/federation"
+  run app _ := json Response.ok <| Json.mkObj [
+    ("protocol", Json.str "trust/2"),
+    ("url", Json.str (Federation.Service.ourUrl app)),
+    ("name", Json.str "from the future")]
+
+/--
+A socket that accepts and never answers.
+
+Not a slow route on a real node: a handler that slept would still be this
+process's to schedule, and what §7.2 is about is a peer whose behaviour is not
+ours at all.  Nothing ever calls `accept`, so the connection completes in the
+kernel and the request waits for as long as the client will let it.
+-/
+private def blackHole : IO (TCP.Socket.Server × Nat) := do
+  let socket ← TCP.Socket.Server.mk
+  socket.bind (SocketAddress.v4 { addr := IPv4Addr.ofParts 127 0 0 1, port := 0 })
+  socket.listen 8
+  let port := match ← socket.getSockName with
+    | .v4 a => a.port.toNat
+    | .v6 a => a.port.toNat
+  return (socket, port)
+
+private structure FederationFindings where
+  skipped : Bool := false
+  /-- §5.2 -/
+  announcedLiarStatus : Nat := 0
+  announcedLiarError : String := ""
+  liarRecorded : Bool := false
+  announcedForeignStatus : Nat := 0
+  announcedForeignError : String := ""
+  foreignRecorded : Bool := false
+  announcedPeerStatus : String := ""
+  peerIsCandidate : Bool := false
+  candidateIsNotQueried : Bool := false
+  peersAfterSecondAnnounce : Nat := 0
+  /-- §5.1, §5.3 -/
+  promotionUnauthorized : Nat := 0
+  promotionStatus : String := ""
+  peersListed : String := ""
+  /-- §4.1 → §4.2 -/
+  pullAccepted : Nat := 0
+  pullRejected : Nat := 0
+  pullRounds : Nat := 0
+  pullCursor : String := ""
+  storedAfterPull : Nat := 0
+  missingAfterPull : Nat := 0
+  secondPullAccepted : Nat := 0
+  secondPullRounds : Nat := 0
+  cursorHeldStill : Bool := false
+  /-- §7.3 -/
+  cacheHitAsked : Nat := 0
+  cacheHitFound : Nat := 0
+  /-- §7 -/
+  relayAsked : Nat := 0
+  relayFound : Nat := 0
+  relayFromPeer : String := ""
+  peerUrl : String := ""
+  relayIsLocal : Bool := true
+  relayTruncated : Bool := true
+  relayFetchedAt : Nat := 0
+  cachedAsked : Nat := 0
+  cachedFound : Nat := 0
+  /-- §7.1 -/
+  selfInViaAsked : Nat := 0
+  selfInViaFound : Nat := 0
+  peerInViaAsked : Nat := 0
+  depthZeroAsked : Nat := 0
+  clampedAsked : Nat := 0
+  withoutViaAsked : Nat := 0
+  withoutViaFound : Nat := 0
+  /-- §7.4 -/
+  httpAnswerStatus : Nat := 0
+  httpAnswerBody : String := ""
+  /-- §7.2 -/
+  budgetMs : Nat := 0
+  budgetAsked : Nat := 0
+  budgetTruncated : Bool := false
+  budgetFound : Nat := 0
+  stillListening : Bool := false
+  deriving Inhabited
+
+private def runFederation (root : System.FilePath) : IO FederationFindings := do
+  if !(← Trust.defaultVerifier.available) then
+    return { skipped := true }
+  IO.FS.withTempDir fun home => do
+    let key ← makeKey home "Node Federation <node@example.org>"
+    if key.primary.isEmpty then
+      return { skipped := true }
+    let mut entries := #[]
+    for i in [0:9] do
+      entries := entries.push
+        (← signedEntry home "node@example.org" key (hashN i) s!"2024-01-0{i + 1}T00:00:00Z")
+    let hinted (entry : Trust.Entry) (origin : String) : StoredCertificate :=
+      { entry, hints := { issuer := "alice", keyVerifiedVia := "github", origin } }
+    let quiet : Policy := { allowPrivate := true }
+    Async.block do
+      -- The peer.  Its own `maxEntries` is the default; what makes it truncate
+      -- is the limit its reader asks for, which is that reader's §8 policy.
+      let peer ← startNode root "peer" quiet
+        (Federation.federationRoutes ++ Federation.peerRoutes)
+      -- The node under test.  Three entries to a bundle, so seven of them
+      -- cannot arrive in one.
+      let node ← startNode root "node"
+        { quiet with maxEntries := 3, peerTimeoutMs := 4000 }
+        (Federation.federationRoutes ++ Federation.peerRoutes) (adminToken := "s3cret")
+      let liar ← startNode root "liar" quiet Federation.federationRoutes
+        (callsItself := "https://elsewhere.example")
+      let foreign ← startNode root "foreign" quiet #[foreignDescriptorRoute]
+      let port := portOf node.server
+      for i in [0:7] do
+        let _ ← peer.store.putCertificate (hinted entries[i]! peer.url)
+
+      -- §5.2.  A node that calls itself something else cannot be announced,
+      -- which is what stops this endpoint being pointed at a third party.
+      let announceOf (url : String) : Async Reply :=
+        request port "POST" "/api/peers/announce"
+          (Json.compress (Json.mkObj [("url", Json.str url)]))
+      let announcedLiar ← announceOf liar.url
+      let liarRecorded := (← node.store.getPeer liar.url).isSome
+        || (← node.store.getPeer "https://elsewhere.example").isSome
+      let announcedForeign ← announceOf foreign.url
+      let foreignRecorded := (← node.store.getPeer foreign.url).isSome
+      -- §5.1: discovery proposes a candidate, and a candidate is never queried.
+      let announcedPeer ← announceOf peer.url
+      let peerIsCandidate :=
+        ((← node.store.getPeer peer.url).map (·.status == .candidate)).getD false
+      let candidateIsNotQueried := (← node.store.queriedPeers).isEmpty
+      -- The same node announced by a URL written differently is the same node.
+      let _ ← announceOf (peer.url ++ "/")
+      let peersAfterSecondAnnounce := (← node.store.listPeers).size
+
+      -- §5.1: only the operator promotes, and only with the operator's token.
+      let promoting := Json.compress (Json.mkObj [("url", Json.str peer.url)])
+      let refused ← request port "POST" "/api/peers/status/seed" promoting
+      let promoted ← request port "POST" "/api/peers/status/seed" promoting
+        #[("Authorization", "Bearer s3cret")]
+      node.store.putPeer { url := "https://candidate.example", name := "c", status := .candidate }
+      node.store.putPeer { url := "https://blocked.example", name := "b", status := .blocked }
+      let peersListed ← request port "GET" "/api/peers"
+
+      -- §4.1 → §4.2.  Seven entries, three to a bundle: `complete: false` means
+      -- resume from the cursor, and nothing may be lost between the pages.
+      let pull ← Federation.Service.detached
+        (Federation.Service.pullFrom (← node.app.get) peer.url)
+      let storedAfterPull := (← node.store.certificatesSince "" 1000).values.size
+      let mut missingAfterPull := 0
+      for i in [0:7] do
+        if (← node.store.getCertificate key.primary (hashN i) "semantic_hash/1").isNone then
+          missingAfterPull := missingAfterPull + 1
+      let secondPull ← Federation.Service.detached
+        (Federation.Service.pullFrom (← node.app.get) peer.url)
+      let cursorHeldStill := secondPull.cursor == pull.cursor && !pull.cursor.isEmpty
+
+      -- §7.3: what a pull left behind is the cache, and it answers without asking.
+      let cacheHit ← Federation.Service.answer (← node.app.get)
+        { hash := hashN 0, hasher := "semantic_hash/1", depth := 2 }
+
+      -- Two entries the peer has and this node has not heard of.
+      let _ ← peer.store.putCertificate (hinted entries[7]! peer.url)
+      let _ ← peer.store.putCertificate (hinted entries[8]! peer.url)
+
+      -- §7: a question this node cannot answer alone travels one hop.
+      let relay ← Federation.Service.answer (← node.app.get)
+        { hash := hashN 7, hasher := "semantic_hash/1", depth := 1 }
+      let cached ← Federation.Service.answer (← node.app.get)
+        { hash := hashN 7, hasher := "semantic_hash/1", depth := 1 }
+
+      -- §7.1.  None of these four may reach the peer, and the peer is the only
+      -- node that has `hashN 8`, so an answer with anything in it is a failure.
+      let unheard : Federation.Service.Question :=
+        { hash := hashN 8, hasher := "semantic_hash/1", depth := 2 }
+      let selfInVia ← Federation.Service.answer (← node.app.get)
+        { unheard with via := #[node.url] }
+      let peerInVia ← Federation.Service.answer (← node.app.get)
+        { unheard with via := #[peer.url] }
+      let depthZero ← Federation.Service.answer (← node.app.get) { unheard with depth := 0 }
+      let app ← node.app.get
+      let clampedApp : App :=
+        { app with config := { app.config with
+            policy := { app.config.policy with maxDepth := 0 } } }
+      let clamped ← Federation.Service.answer clampedApp { unheard with depth := 5 }
+      -- …and with nothing in the way, the same question does travel.
+      let withoutVia ← Federation.Service.answer (← node.app.get) unheard
+      let httpAnswer ← request port "GET"
+        s!"/api/certificates?hash={hashN 0}&hasher=semantic_hash/1&depth=0"
+
+      -- §7.2.  One peer that never answers, a budget well inside its timeout,
+      -- and a reader who is told the answer was cut short rather than that it
+      -- is all there is.
+      let (hole, holePort) ← blackHole
+      let silent ← Store.open (root / "silent") { fsync := false }
+      silent.putPeer { url := s!"http://127.0.0.1:{holePort}", status := .seed }
+      let silentApp : App := {
+        config := {
+          port := 0, name := "silent", localMode := true
+          publicUrl := "http://127.0.0.1:1"
+          policy := { quiet with queryBudgetMs := 700, peerTimeoutMs := 3000 } }
+        store := silent }
+      let started ← nowMs
+      let budget ← Federation.Service.answer silentApp
+        { hash := hashN 0, hasher := "semantic_hash/1", depth := 1 }
+      let budgetMs := (← nowMs) - started
+      -- The socket has to be *used* after the measurement, or it is collected
+      -- while the question is in flight and the port closes: a connection
+      -- refused in a millisecond is not the peer §7.2 is about, and a test that
+      -- measured one would pass for the wrong reason.
+      let stillListening ← match ← hole.getSockName with
+        | .v4 a => pure (a.port.toNat == holePort)
+        | .v6 a => pure (a.port.toNat == holePort)
+
+      node.server.shutdownAndWait
+      peer.server.shutdownAndWait
+      liar.server.shutdownAndWait
+      foreign.server.shutdownAndWait
+      return {
+        announcedLiarStatus := announcedLiar.status
+        announcedLiarError := jStr (parsed announcedLiar) "error"
+        liarRecorded
+        announcedForeignStatus := announcedForeign.status
+        announcedForeignError := jStr (parsed announcedForeign) "error"
+        foreignRecorded
+        announcedPeerStatus := jStr (parsed announcedPeer) "status"
+        peerIsCandidate, candidateIsNotQueried, peersAfterSecondAnnounce
+        promotionUnauthorized := refused.status
+        promotionStatus := jStr (parsed promoted) "status"
+        peersListed := peersListed.body
+        pullAccepted := pull.accepted, pullRejected := pull.rejected, pullRounds := pull.rounds
+        pullCursor := pull.cursor, storedAfterPull, missingAfterPull
+        secondPullAccepted := secondPull.accepted, secondPullRounds := secondPull.rounds
+        cursorHeldStill
+        cacheHitAsked := cacheHit.askedPeers, cacheHitFound := cacheHit.certificates.size
+        relayAsked := relay.askedPeers, relayFound := relay.certificates.size
+        relayFromPeer := ((relay.certificates[0]?).map (·.fromPeer)).getD "<nothing>"
+        peerUrl := peer.url
+        relayIsLocal := ((relay.certificates[0]?).map (·.fromPeer.isEmpty)).getD true
+        relayTruncated := relay.truncated
+        relayFetchedAt := ((relay.certificates[0]?).map (·.fetchedMs)).getD 0
+        cachedAsked := cached.askedPeers, cachedFound := cached.certificates.size
+        selfInViaAsked := selfInVia.askedPeers, selfInViaFound := selfInVia.certificates.size
+        peerInViaAsked := peerInVia.askedPeers
+        depthZeroAsked := depthZero.askedPeers
+        clampedAsked := clamped.askedPeers
+        withoutViaAsked := withoutVia.askedPeers, withoutViaFound := withoutVia.certificates.size
+        httpAnswerStatus := httpAnswer.status, httpAnswerBody := httpAnswer.body
+        budgetMs, budgetAsked := budget.askedPeers, budgetTruncated := budget.truncated
+        budgetFound := budget.certificates.size, stillListening }
+
+private def federationTests (f : FederationFindings) : TestSeq :=
+  if f.skipped then
+    group "federation" <|
+      test "SKIPPED: gpg is not on PATH, so no signed entry could be made" true
+  else
+  group "federation" <|
+    group "§5.2 announcing" (
+      test "a node that calls itself something else is refused"
+        (contains f.announcedLiarError "calls itself something else" = true) <|
+      test "with a 400 rather than a silence" (f.announcedLiarStatus = 400) <|
+      test "and is not recorded under either name, which is what stops a scanner"
+        (f.liarRecorded = false) <|
+      test "a node speaking another protocol is refused"
+        (contains f.announcedForeignError "speaks trust/2" = true) <|
+      test "also with a 400" (f.announcedForeignStatus = 400) <|
+      test "and is not recorded" (f.foreignRecorded = false) <|
+      test "a node that names itself correctly is recorded"
+        (f.announcedPeerStatus = "candidate") <|
+      test "as a candidate, because autodiscover is off" (f.peerIsCandidate = true) <|
+      test "and a candidate is never queried" (f.candidateIsNotQueried = true) <|
+      test "the same node announced by a differently written URL is the same node"
+        (f.peersAfterSecondAnnounce = 1)) <|
+    group "§5.1 and §5.3 peer states" (
+      test "promotion needs the operator's token" (f.promotionUnauthorized = 401) <|
+      test "and with it, moves the peer" (f.promotionStatus = "seed") <|
+      test "§5.3 lists what this node queries" (contains f.peersListed "127.0.0.1" = true) <|
+      test "and not a candidate, whose address this node was merely asked to probe"
+        (contains f.peersListed "candidate.example" = false) <|
+      test "and not a blocked node, which is the operator's judgement"
+        (contains f.peersListed "blocked.example" = false)) <|
+    group "§4.1 pulling from a peer that truncates" (
+      test "every entry arrived" (f.pullAccepted = 7) <|
+      test "and none was refused" (f.pullRejected = 0) <|
+      test "it took more than one bundle, so `complete: false` really was resumed"
+        (f.pullRounds = 3) <|
+      test "the store holds them all" (f.storedAfterPull = 7) <|
+      test "and nothing fell between two pages" (f.missingAfterPull = 0) <|
+      test "the cursor was kept" (f.pullCursor ≠ "") <|
+      test "a second pull from the same cursor accepts nothing"
+        (f.secondPullAccepted = 0) <|
+      test "in one round" (f.secondPullRounds = 1) <|
+      test "and leaves the cursor where it was" (f.cursorHeldStill = true)) <|
+    group "§7.3 the cache" (
+      test "a fresh remote answer is answered from here" (f.cacheHitAsked = 0) <|
+      test "and it is the entry that was pulled" (f.cacheHitFound = 1) <|
+      test "a question nobody here can answer goes out" (f.relayAsked = 1) <|
+      test "and comes back with the certificate" (f.relayFound = 1) <|
+      test "marked as somebody else's" (f.relayIsLocal = false) <|
+      test "with the peer it came from" (f.relayFromPeer = f.peerUrl) <|
+      test "and when it arrived" (f.relayFetchedAt > 0) <|
+      test "the answer is not truncated: everyone asked, answered"
+        (f.relayTruncated = false) <|
+      test "asking again within the TTL asks nobody" (f.cachedAsked = 0) <|
+      test "and answers anyway" (f.cachedFound = 1)) <|
+    group "§7.1 depth and loops" (
+      test "a node that finds itself in `via` relays nowhere" (f.selfInViaAsked = 0) <|
+      test "and answers locally, which here is with nothing" (f.selfInViaFound = 0) <|
+      test "a peer already in `via` is not relayed to" (f.peerInViaAsked = 0) <|
+      test "depth 0 is local only" (f.depthZeroAsked = 0) <|
+      test "and the asker's depth is clamped to this node's own maximum"
+        (f.clampedAsked = 0) <|
+      test "with nothing in the way, the same question does travel"
+        (f.withoutViaAsked = 1) <|
+      test "and is answered" (f.withoutViaFound = 1)) <|
+    group "§7.4 the response" (
+      test "§7 answers over HTTP" (f.httpAnswerStatus = 200) <|
+      test "with the canonical bytes, so the reader need not rebuild them"
+        (contains f.httpAnswerBody "\"canonical\":\"{\\\"asserted\\\"" = true) <|
+      test "saying this node checked it"
+        (contains f.httpAnswerBody "\"verifiedHere\":true" = true) <|
+      test "that hints are not to be believed"
+        (contains f.httpAnswerBody "\"hintsVerified\":false" = true) <|
+      test "and that the answer is whole"
+        (contains f.httpAnswerBody "\"truncated\":false" = true)) <|
+    group "§7.2 the budget" (
+      test "a peer that never answers is asked" (f.budgetAsked = 1) <|
+      test "and really was listening, rather than refusing in a millisecond"
+        (f.stillListening = true) <|
+      test "and waited for, but only until the budget expires"
+        (f.budgetMs ≥ 700 ∧ f.budgetMs < 2500) <|
+      test "the answer says it was cut short" (f.budgetTruncated = true) <|
+      test "rather than reporting that nobody vouches for it" (f.budgetFound = 0))
+
 /-! ## Runner -/
 
 def main : IO UInt32 := do
@@ -1049,10 +1443,12 @@ def main : IO UInt32 := do
   try
     let findings ← runStore root
     let routes ← runRoutes root
+    let federated ← runFederation root
     lspecIO (.ofList [
       ("timestamps", [timeTests]),
       ("config", [configTests]),
       ("store", [storeTests findings]),
-      ("routes", [routeTests routes])]) []
+      ("routes", [routeTests routes]),
+      ("federation", [federationTests federated])]) []
   finally
     IO.FS.removeDirAll root

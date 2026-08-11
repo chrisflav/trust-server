@@ -28,9 +28,10 @@ rev = "3e23a4ad2e91eaf07845cecad157b7ffbb437aed"
 
 [[lean_lib]]
 name = "TrustServer"
-# Every module, not just the root: `TrustServer.Routes` and `TrustServer.Auth`
-# are reached from the tests rather than from `TrustServer.lean`, and a module
-# that only the tests build is one that `lake build` cannot tell you is broken.
+# Every module, not just the root: `TrustServer.Routes`, `TrustServer.Auth` and
+# `TrustServer.Federation.*` are reached from the tests rather than from
+# `TrustServer.lean`, and a module that only the tests build is one that
+# `lake build` cannot tell you is broken.
 globs = ["TrustServer", "TrustServer.+"]
 
 [[lean_exe]]
