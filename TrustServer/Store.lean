@@ -189,6 +189,29 @@ instance : FromJson StoredCertificate where
       fromPeer := (j.getObjValAs? String "fromPeer").toOption.getD ""
       fetchedMs := (j.getObjValAs? Nat "fetchedMs").toOption.getD 0 }
 
+/--
+§3.1's two assurances, read off the row rather than stored beside it.
+
+A row carries a signature exactly when this node checked one before writing it —
+nothing here ever stores an unverified signature — so `signed` and `attested`
+are decided by the entry itself and there is no second field that could come to
+disagree with it.
+-/
+def StoredCertificate.assurance (c : StoredCertificate) : String :=
+  if c.entry.signature.isEmpty then "attested" else "signed"
+
+/--
+Whether §3.1 lets this row leave the node.
+
+`attested` is a statement about *this server's* authentication; there is nothing
+in it for a receiver to check, so it stays where it was made.
+-/
+def StoredCertificate.federates (c : StoredCertificate) : Bool :=
+  !c.entry.signature.isEmpty && !c.entry.key.isEmpty && !c.entry.fingerprint.isEmpty
+
+/-- Issued here, rather than relayed to us. -/
+def StoredCertificate.isLocal (c : StoredCertificate) : Bool := c.fromPeer.isEmpty
+
 /-- The four states of §5.1.  Discovery may propose a candidate, never promote one. -/
 inductive PeerStatus where
   /-- Configured by the operator; queried. -/
@@ -246,19 +269,89 @@ structure Identity where
   deriving Inhabited, Repr, ToJson, FromJson
 
 /--
-A command-line token, by its digest.
+An armoured **public** key, and how firmly it is tied to an account.
 
-The token itself is never written down: a leaked store should not hand anyone
-the ability to publish as someone else.  A token says who is publishing; it
-cannot forge a signature, so it is not what makes a certificate worth anything.
+`verifiedVia` is a claim about ownership and the three values are not
+interchangeable: `github` means the account publishes this key itself, through a
+party that is not us; `self` means somebody pasted it here while signed in;
+`remote` means it arrived attached to a federated entry and is tied to nothing
+this node checked.  Presenting the second as the first would be exactly the
+unverified binding §1 forbids.
+-/
+structure PublicKey where
+  fingerprint : String
+  /-- The account that registered it.  Empty for a key seen only on the wire. -/
+  login : String
+  armored : String
+  verifiedVia : String := "self"
+  addedMs : Nat := 0
+  deriving Inhabited, Repr, ToJson, FromJson
+
+/-- What a stored secret is for.  All three are opaque values; only their lifetimes differ. -/
+inductive SessionKind where
+  /-- A browser session, held in a cookie. -/
+  | browser
+  /-- A command-line token, which never expires until it is revoked. -/
+  | api
+  /-- The anti-forgery `state` of an OAuth round trip; minutes, not days. -/
+  | oauthState
+  deriving Inhabited, Repr, DecidableEq, BEq
+
+namespace SessionKind
+
+def toString : SessionKind → String
+  | .browser => "session" | .api => "token" | .oauthState => "state"
+
+def ofString? : String → Option SessionKind
+  | "session" => some .browser | "token" => some .api | "state" => some .oauthState
+  | _ => none
+
+end SessionKind
+
+instance : ToJson SessionKind where toJson k := Json.str k.toString
+instance : FromJson SessionKind where
+  fromJson? j := do
+    let s ← j.getStr?
+    match SessionKind.ofString? s with
+    | some kind => return kind
+    | none => throw s!"`{s}` is not a kind of session"
+
+/--
+A credential: a random value, who it speaks for, and when it dies.
+
+**The token is stored as it stands, and that is a deliberate, documented
+trade.**  The TypeScript keeps only a SHA-256 digest, so that a leaked database
+does not hand anyone the ability to publish as someone else.  Lean v4.32.0 has
+no SHA-2 anywhere in its toolchain and this package refuses to grow a hand-rolled
+one — a hash function written to make a comment true is worse than the comment
+being false.  So the store file is exactly as sensitive as the sessions in it,
+which is a thing an operator can be told, rather than a thing they might
+believe wrongly.
+
+What the digest bought is not, in fact, what makes a certificate worth
+anything: a token says who is publishing, and cannot forge a signature.
+
+`id` is not the secret.  It exists so a token can be listed and revoked without
+the value ever coming back out of the server.
 -/
 structure Session where
-  tokenSha256 : String
-  login : String
+  /-- The opaque value the client presents. -/
+  token : String
+  /-- A name for the row that is safe to hand out. -/
+  id : String := ""
+  kind : SessionKind := .browser
+  /-- The identity it speaks for.  Empty for an OAuth state, which speaks for nobody yet. -/
+  login : String := ""
+  /-- What its owner called it, for a list of tokens that means something. -/
   name : String := ""
   createdMs : Nat := 0
+  /-- Epoch milliseconds after which it is dead.  `0` never expires. -/
+  expiresMs : Nat := 0
   lastUsedMs : Nat := 0
   deriving Inhabited, Repr, ToJson, FromJson
+
+/-- Whether a credential is still alive at `now`, in epoch milliseconds. -/
+def Session.alive (s : Session) (now : Nat) : Bool := s.expiresMs == 0 || now < s.expiresMs
 
 /-- Whose certificates count for someone.  Explicit, one hop, never transitive. -/
 structure Follow where
@@ -285,6 +378,18 @@ def tupleKey (parts : List String) : String :=
 /-- §3.5: an entry's identity is `(fingerprint, hash, hasher)`, nothing else. -/
 def certificateKey (fingerprint hash hasher : String) : String :=
   tupleKey [fingerprint.toLower, hash.toLower, hasher]
+
+/--
+The key an `attested` row is filed under.
+
+§3.5's triple identifies a *signed* entry, and an unsigned one has no
+fingerprint to put in it.  Filing every attested row under the empty
+fingerprint would make two accounts' assertions about the same hash collide, so
+the issuer stands in for the key that is missing.  The prefix keeps that
+namespace disjoint from any real fingerprint, which is hex.
+-/
+def attestedKey (issuer hash hasher : String) : String :=
+  certificateKey s!"attested:{issuer}" hash hasher
 
 /-- §6.2 matches on the same triple, so a revocation is keyed the same way. -/
 def revocationKey (fingerprint hash hasher : String) : String :=
@@ -428,6 +533,7 @@ structure StoreState where
   revocations : Table Trust.SignedRevocation
   peers : Table Peer
   identities : Table Identity
+  keys : Table PublicKey
   sessions : Table Session
   follows : Table Follow
 
@@ -453,6 +559,7 @@ def «open» (dir : FilePath) (opts : Options := {}) : IO Store := do
   let revocations ← Table.load (α := Trust.SignedRevocation) (dir / "revocations.jsonl")
   let peers ← Table.load (α := Peer) (dir / "peers.jsonl")
   let identities ← Table.load (α := Identity) (dir / "identities.jsonl")
+  let keys ← Table.load (α := PublicKey) (dir / "keys.jsonl")
   let sessions ← Table.load (α := Session) (dir / "sessions.jsonl")
   let follows ← Table.load (α := Follow) (dir / "follows.jsonl")
   -- The next row id continues past everything already written; reusing one
@@ -460,16 +567,17 @@ def «open» (dir : FilePath) (opts : Options := {}) : IO Store := do
   -- row id exists to prevent.
   let nextSeq := 1 + max (maxSeq certificates.liveRows)
     (max (maxSeq revocations.liveRows) (max (maxSeq peers.liveRows)
-      (max (maxSeq identities.liveRows) (max (maxSeq sessions.liveRows)
-        (maxSeq follows.liveRows)))))
+      (max (maxSeq identities.liveRows) (max (maxSeq keys.liveRows)
+        (max (maxSeq sessions.liveRows) (maxSeq follows.liveRows))))))
   let certificates ← certificates.compactIfNeeded opts
   let revocations ← revocations.compactIfNeeded opts
   let peers ← peers.compactIfNeeded opts
   let identities ← identities.compactIfNeeded opts
+  let keys ← keys.compactIfNeeded opts
   let sessions ← sessions.compactIfNeeded opts
   let follows ← follows.compactIfNeeded opts
   let state ← Std.Mutex.new
-    { dir, opts, nextSeq, certificates, revocations, peers, identities, sessions, follows }
+    { dir, opts, nextSeq, certificates, revocations, peers, identities, keys, sessions, follows }
   return { state }
 
 /-- Read something out of the index under the lock. -/
@@ -507,7 +615,9 @@ oscillating between two nodes' copies.
 -/
 def putCertificate (s : Store) (cert : StoredCertificate) : IO PutOutcome := do
   let claim := cert.entry.claim
-  let key := certificateKey cert.entry.fingerprint claim.hash claim.hasher
+  let key :=
+    if cert.entry.fingerprint.isEmpty then attestedKey cert.hints.issuer claim.hash claim.hasher
+    else certificateKey cert.entry.fingerprint claim.hash claim.hasher
   let existing ← s.read fun st => (st.certificates.live.get? key).bind (·.value)
   let outcome :=
     match existing with
@@ -599,6 +709,39 @@ def certificatesByFingerprint (s : Store) (fingerprint : String) :
     out := out.push cert
   return out
 
+/-- Every live certificate row, §6.2 not applied.  The caller decides what to hide. -/
+def liveCertificates (s : Store) : IO (Array StoredCertificate) :=
+  s.read fun st => st.certificates.liveRows.filterMap (·.value)
+
+/--
+Withdraw an account's own rows for a hash from this node's log.
+
+Only what this node originated and only what that account issued: a copy that
+arrived from a peer is not ours to take back, and a signed withdrawal (§6) is
+the form that travels.  Returns how many rows were tombstoned.
+-/
+def withdrawLocal (s : Store) (issuer hash : String) : IO Nat := do
+  let all ← s.read fun st => st.certificates.live.toArray
+  let mut removed := 0
+  for (key, row) in all do
+    let some cert := row.value | continue
+    if !cert.isLocal then continue
+    if cert.hints.issuer != issuer then continue
+    if cert.entry.claim.hash.toLower != hash.toLower then continue
+    let _ ← s.write (·.certificates) (fun st t => { st with certificates := t }) key none
+    removed := removed + 1
+  return removed
+
+/-- Withdrawals matching a filter, for the bundle a query answers with. -/
+def revocationsFor (s : Store) (hash : Option String := none) (hasher : Option String := none)
+    (fingerprint : Option String := none) : IO (Array Trust.SignedRevocation) := do
+  let all ← s.read fun st => st.revocations.liveRows.filterMap (·.value)
+  return all.filter fun rev =>
+    let r := rev.revocation
+    (match hash with | some h => r.hash.toLower == h.toLower | none => true) &&
+      (match hasher with | some h => r.hasher == h | none => true) &&
+      (match fingerprint with | some f => r.fingerprint.toLower == f.toLower | none => true)
+
 /-! ### Export (§4.1) -/
 
 /--
@@ -682,7 +825,7 @@ def notePeerSeen (s : Store) (url cursor error : String) : IO Unit := do
 def forgetPeer (s : Store) (url : String) : IO Unit := do
   let _ ← s.write (·.peers) (fun st t => { st with peers := t }) (tupleKey [url]) none
 
-/-! ### Identities, sessions, follows -/
+/-! ### Identities, keys, sessions, follows -/
 
 def putIdentity (s : Store) (identity : Identity) : IO Unit := do
   let createdMs ← if identity.createdMs != 0 then pure identity.createdMs else nowMs
@@ -692,18 +835,118 @@ def putIdentity (s : Store) (identity : Identity) : IO Unit := do
 def getIdentity (s : Store) (login : String) : IO (Option Identity) :=
   s.read fun st => (st.identities.live.get? (tupleKey [login])).bind (·.value)
 
+/-- The account a GitHub id belongs to, whatever it currently calls itself. -/
+def identityByGitHubId (s : Store) (githubId : Int) : IO (Option Identity) := do
+  if githubId < 0 then return none
+  let all ← s.read fun st => st.identities.liveRows.filterMap (·.value)
+  return all.find? (·.githubId == githubId)
+
+def listIdentities (s : Store) : IO (Array Identity) :=
+  s.read fun st => st.identities.liveRows.filterMap (·.value)
+
+/--
+Follow a GitHub rename.
+
+Identities, keys and follows are all filed under the login, because that is what
+a certificate's hints and a trust list name.  A renamed account is still the
+same account — its GitHub id has not moved — so the rows move with it rather
+than the person losing their keys and their trust list to a change of name.
+-/
+def renameIdentity (s : Store) (oldLogin newLogin : String) : IO Unit := do
+  if oldLogin == newLogin then return ()
+  let some identity ← s.getIdentity oldLogin | return ()
+  let _ ← s.write (·.identities) (fun st t => { st with identities := t })
+    (tupleKey [oldLogin]) none
+  s.putIdentity { identity with login := newLogin }
+  let keys ← s.read fun st => st.keys.live.toArray
+  for (key, row) in keys do
+    let some stored := row.value | continue
+    if stored.login != oldLogin then continue
+    let _ ← s.write (·.keys) (fun st t => { st with keys := t }) key none
+    let _ ← s.write (·.keys) (fun st t => { st with keys := t })
+      (tupleKey [newLogin, stored.fingerprint.toLower]) (some { stored with login := newLogin })
+  let follows ← s.read fun st => st.follows.live.toArray
+  for (key, row) in follows do
+    let some follow := row.value | continue
+    if follow.truster != oldLogin then continue
+    let _ ← s.write (·.follows) (fun st t => { st with follows := t }) key none
+    let _ ← s.write (·.follows) (fun st t => { st with follows := t })
+      (tupleKey [newLogin, follow.kind, follow.target]) (some { follow with truster := newLogin })
+
+/-- Register a public key against an account.  Nothing else is ever stored beside one. -/
+def putKey (s : Store) (key : PublicKey) : IO Unit := do
+  let addedMs ← if key.addedMs != 0 then pure key.addedMs else nowMs
+  let _ ← s.write (·.keys) (fun st t => { st with keys := t })
+    (tupleKey [key.login, key.fingerprint.toLower])
+    (some { key with fingerprint := key.fingerprint.toLower, addedMs })
+
+def keysForLogin (s : Store) (login : String) : IO (Array PublicKey) := do
+  let all ← s.read fun st => st.keys.liveRows.filterMap (·.value)
+  return all.filter (·.login == login)
+
+/--
+Any key this node has seen, wherever it saw it.
+
+Falls back to the key a federated entry travelled with, marked `remote`: a
+reader checking a relayed entry has a fingerprint and nothing else they could
+have looked up, and that key is tied to nothing this node verified about an
+account.
+-/
+def keyByFingerprint (s : Store) (fingerprint : String) : IO (Option PublicKey) := do
+  let wanted := fingerprint.toLower
+  let registered ← s.read fun st => st.keys.liveRows.filterMap (·.value)
+  match registered.find? (·.fingerprint.toLower == wanted) with
+  | some key => return some key
+  | none =>
+    let certificates ← s.liveCertificates
+    match certificates.find? (fun c => c.entry.fingerprint.toLower == wanted &&
+        !c.entry.key.isEmpty) with
+    | some cert => return some {
+        fingerprint := wanted, login := cert.hints.issuer, armored := cert.entry.key,
+        verifiedVia := "remote" }
+    | none => return none
+
+/--
+Write down a credential.
+
+Filed under the value itself, so that presenting it is a lookup rather than a
+scan.  The comparison that *decides* anything is still `secureEqual` in
+`TrustServer.Auth`: a hash-map probe is a hint, not an authorisation.
+-/
 def putSession (s : Store) (session : Session) : IO Unit := do
   let createdMs ← if session.createdMs != 0 then pure session.createdMs else nowMs
   let _ ← s.write (·.sessions) (fun st t => { st with sessions := t })
-    (tupleKey [session.tokenSha256]) (some { session with createdMs })
+    (tupleKey [session.token]) (some { session with createdMs })
 
-/-- Resolve a bearer token by its digest.  The token itself is never stored. -/
-def getSession (s : Store) (tokenSha256 : String) : IO (Option Session) :=
-  s.read fun st => (st.sessions.live.get? (tupleKey [tokenSha256])).bind (·.value)
+/-- The row a presented value names, if there is one.  Expiry is the caller's to check. -/
+def getSession (s : Store) (token : String) : IO (Option Session) :=
+  s.read fun st => (st.sessions.live.get? (tupleKey [token])).bind (·.value)
 
-def deleteSession (s : Store) (tokenSha256 : String) : IO Unit := do
+/-- A credential by its public id, which is what a listing hands out. -/
+def sessionById (s : Store) (id : String) : IO (Option Session) := do
+  if id.isEmpty then return none
+  let all ← s.read fun st => st.sessions.liveRows.filterMap (·.value)
+  return all.find? (·.id == id)
+
+def listSessions (s : Store) (login : String) (kind : SessionKind) : IO (Array Session) := do
+  let all ← s.read fun st => st.sessions.liveRows.filterMap (·.value)
+  return all.filter fun session => session.login == login && session.kind == kind
+
+def deleteSession (s : Store) (token : String) : IO Unit := do
   let _ ← s.write (·.sessions) (fun st t => { st with sessions := t })
-    (tupleKey [tokenSha256]) none
+    (tupleKey [token]) none
+
+/-- Drop everything that has died, so an OAuth round trip cannot grow the log forever. -/
+def expireSessions (s : Store) : IO Nat := do
+  let now ← nowMs
+  let all ← s.read fun st => st.sessions.live.toArray
+  let mut dropped := 0
+  for (key, row) in all do
+    let some session := row.value | continue
+    if session.alive now then continue
+    let _ ← s.write (·.sessions) (fun st t => { st with sessions := t }) key none
+    dropped := dropped + 1
+  return dropped
 
 def putFollow (s : Store) (follow : Follow) : IO Unit := do
   let addedMs ← if follow.addedMs != 0 then pure follow.addedMs else nowMs
@@ -734,9 +977,10 @@ def compact (s : Store) : IO Unit :=
     let revocations ← st.revocations.compact st.opts
     let peers ← st.peers.compact st.opts
     let identities ← st.identities.compact st.opts
+    let keys ← st.keys.compact st.opts
     let sessions ← st.sessions.compact st.opts
     let follows ← st.follows.compact st.opts
-    set { st with certificates, revocations, peers, identities, sessions, follows }
+    set { st with certificates, revocations, peers, identities, keys, sessions, follows }
 
 /-- Records on disk and live rows for the certificate log; for tests and for compaction. -/
 def certificateLogSize (s : Store) : IO (Nat × Nat) :=
@@ -750,6 +994,7 @@ def flush (s : Store) : IO Unit :=
     st.revocations.handle.flush
     st.peers.handle.flush
     st.identities.handle.flush
+    st.keys.handle.flush
     st.sessions.handle.flush
     st.follows.handle.flush
 
