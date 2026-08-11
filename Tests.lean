@@ -65,22 +65,26 @@ private def hash2 := "fedcba9876543210fedcba9876543210"
 
 private def timeTests : TestSeq :=
   group "timestamps and cursors" <|
+    -- The parsing itself is core's, and core tests it.  What is checked here is
+    -- that this node reaches for core's rules rather than growing its own: a
+    -- second implementation of §3.2's timestamps is exactly the drift the
+    -- rewrite exists to remove.
     test "the epoch is zero"
-      (parseTimestampMs "1970-01-01T00:00:00Z" = some 0) <|
+      (Trust.epochMillis? "1970-01-01T00:00:00Z" = some 0) <|
     test "a known instant"
-      (parseTimestampMs "2024-05-31T21:28:37Z" = some 1717190917000) <|
+      (Trust.epochMillis? "2024-05-31T21:28:37Z" = some 1717190917000) <|
     test "milliseconds are kept"
-      (parseTimestampMs "2024-05-31T21:28:37.250Z" = some 1717190917250) <|
+      (Trust.epochMillis? "2024-05-31T21:28:37.250Z" = some 1717190917250) <|
     test "an offset is applied"
-      (parseTimestampMs "2024-05-31T23:28:37+02:00" = some 1717190917000) <|
+      (Trust.epochMillis? "2024-05-31T23:28:37+02:00" = some 1717190917000) <|
     test "second and millisecond spellings of one instant compare equal"
-      (parseTimestampMs "2024-05-31T21:28:37Z" = parseTimestampMs "2024-05-31T21:28:37.000Z") <|
+      (Trust.epochMillis? "2024-05-31T21:28:37Z" = Trust.epochMillis? "2024-05-31T21:28:37.000Z") <|
     test "rubbish does not parse"
-      (parseTimestampMs "yesterday" = none) <|
+      (Trust.epochMillis? "yesterday" = none) <|
     test "later is strict"
-      (isLater "2024-01-02T00:00:00Z" "2024-01-01T00:00:00Z" = true) <|
+      (Trust.laterThan "2024-01-02T00:00:00Z" "2024-01-01T00:00:00Z" = true) <|
     test "a tie is not later"
-      (isLater "2024-01-01T00:00:00Z" "2024-01-01T00:00:00Z" = false) <|
+      (Trust.laterThan "2024-01-01T00:00:00Z" "2024-01-01T00:00:00Z" = false) <|
     test "a cursor round trips"
       (Cursor.decode? (Cursor.encode { ms := 1717171717, seq := 4821 })
         = some { ms := 1717171717, seq := 4821 }) <|

@@ -62,101 +62,6 @@ def nowMs : IO Nat := do
   let ts ← Std.Time.Timestamp.now
   return ts.toMillisecondsSinceUnixEpoch.val.toNat
 
-/--
-Days from 1970-01-01 to `y-m-d`, by Howard Hinnant's days-from-civil algorithm.
-
-Written out rather than taken from `Std.Time` because the only thing needed is a
-total order on the timestamps §3.5 and §6.2 compare, and a parser that returns
-`none` on anything it does not understand is easier to reason about than one
-that throws.
--/
-private def daysFromCivil (y m d : Nat) : Int :=
-  let y' := if m ≤ 2 then y - 1 else y
-  let era := y' / 400
-  let yoe := y' - era * 400
-  let mp := (m + 9) % 12
-  let doy := (153 * mp + 2) / 5 + d - 1
-  let doe := yoe * 365 + yoe / 4 - yoe / 100 + doy
-  ((era * 146097 + doe : Nat) : Int) - (719468 : Nat)
-
-private def takeDigits (cs : List Char) (n : Nat) : Option (Nat × List Char) := Id.run do
-  let mut value := 0
-  let mut rest := cs
-  for _ in [0:n] do
-    match rest with
-    | c :: tail =>
-      if c.isDigit then
-        value := value * 10 + (c.val - '0'.val).toNat
-        rest := tail
-      else
-        return none
-    | [] => return none
-  return some (value, rest)
-
-/--
-An RFC 3339 timestamp as epoch milliseconds, or `none` if it is not one.
-
-Accepts `YYYY-MM-DDTHH:MM:SS`, optional fractional seconds, and either `Z` or a
-numeric offset.  A missing zone is read as UTC: §3.2 says these are UTC, and
-refusing to order a timestamp because it omitted the `Z` would be worse than
-assuming what the specification already requires.
--/
-def parseTimestampMs (s : String) : Option Int := do
-  let cs := s.trimAscii.toString.toList
-  let (year, cs) ← takeDigits cs 4
-  let cs ← match cs with | '-' :: t => some t | _ => none
-  let (month, cs) ← takeDigits cs 2
-  let cs ← match cs with | '-' :: t => some t | _ => none
-  let (day, cs) ← takeDigits cs 2
-  if month < 1 || month > 12 || day < 1 || day > 31 then none
-  let cs ← match cs with
-    | c :: t => if c == 'T' || c == 't' || c == ' ' then some t else none
-    | _ => none
-  let (hour, cs) ← takeDigits cs 2
-  let cs ← match cs with | ':' :: t => some t | _ => none
-  let (minute, cs) ← takeDigits cs 2
-  let cs ← match cs with | ':' :: t => some t | _ => none
-  let (second, cs) ← takeDigits cs 2
-  -- Fractional seconds, to millisecond precision; further digits are dropped
-  -- rather than rounded, so that ordering never depends on how many a signer
-  -- happened to write.
-  let (millis, cs) :=
-    match cs with
-    | '.' :: rest =>
-      let frac := rest.takeWhile Char.isDigit
-      let tail := rest.dropWhile Char.isDigit
-      let digits := frac.take 3 ++ List.replicate (3 - min 3 frac.length) '0'
-      (digits.foldl (fun acc c => acc * 10 + (c.val - '0'.val).toNat) 0, tail)
-    | _ => (0, cs)
-  let offsetSeconds : Int ←
-    match cs with
-    | [] => some 0
-    | ['Z'] | ['z'] => some 0
-    | sign :: rest =>
-      if sign != '+' && sign != '-' then none
-      else do
-        let (oh, rest) ← takeDigits rest 2
-        let rest := match rest with | ':' :: t => t | t => t
-        let (om, rest) ← takeDigits rest 2
-        if !rest.isEmpty then none
-        let magnitude : Int := oh * 3600 + om * 60
-        some (if sign == '-' then -magnitude else magnitude)
-  let days := daysFromCivil year month day
-  let seconds := days * 86400 + (hour * 3600 + minute * 60 + second : Nat) - offsetSeconds
-  some (seconds * 1000 + millis)
-
-/--
-Whether `a` is strictly later than `b`.
-
-Both are timestamps as they were *signed*, so they are compared as instants when
-both parse, and lexicographically when they do not — an unparseable timestamp
-still has to sort somewhere, and RFC 3339 in UTC sorts correctly as text anyway.
-Strictness is what §3.5 means by "ties keep what is already stored".
--/
-def isLater (a b : String) : Bool :=
-  match parseTimestampMs a, parseTimestampMs b with
-  | some x, some y => x > y
-  | _, _ => a > b
 
 /-! ## Cursors (§4.3) -/
 
@@ -607,7 +512,7 @@ def putCertificate (s : Store) (cert : StoredCertificate) : IO PutOutcome := do
   let outcome :=
     match existing with
     | none => PutOutcome.inserted
-    | some old => if isLater claim.asserted old.entry.claim.asserted then .replaced else .kept
+    | some old => if Trust.laterThan claim.asserted old.entry.claim.asserted then .replaced else .kept
   if outcome == .kept then return outcome
   let _ ← s.write (·.certificates) (fun st t => { st with certificates := t }) key (some cert)
   return outcome
@@ -639,7 +544,7 @@ def putRevocation (s : Store) (rev : Trust.SignedRevocation) : IO PutOutcome := 
   let outcome :=
     match existing with
     | none => PutOutcome.inserted
-    | some old => if isLater r.revoked old.revocation.revoked then .replaced else .kept
+    | some old => if Trust.laterThan r.revoked old.revocation.revoked then .replaced else .kept
   if outcome == .kept then return outcome
   let _ ← s.write (·.revocations) (fun st t => { st with revocations := t }) key (some rev)
   return outcome
@@ -660,7 +565,7 @@ second message.
 def isRevoked (s : Store) (fingerprint hash hasher asserted : String) : IO Bool := do
   match ← s.getRevocation fingerprint hash hasher with
   | none => return false
-  | some rev => return !isLater asserted rev.revocation.revoked
+  | some rev => return Trust.notLaterThan asserted rev.revocation.revoked
 
 /-- Everything stored for a hash, with §6.2 applied unless asked otherwise. -/
 def certificatesByHash (s : Store) (hash : String) (hasher : Option String := none)
@@ -677,7 +582,7 @@ def certificatesByHash (s : Store) (hash : String) (hasher : Option String := no
       if !includeRevoked then
         let key := revocationKey cert.entry.fingerprint claim.hash claim.hasher
         if let some rev := (st.revocations.live.get? key).bind (·.value) then
-          if !isLater claim.asserted rev.revocation.revoked then continue
+          if Trust.notLaterThan claim.asserted rev.revocation.revoked then continue
       out := out.push cert
     return out
 
