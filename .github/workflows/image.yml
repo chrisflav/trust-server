@@ -1,0 +1,104 @@
+# Build the image on every pull request; publish it from master.
+#
+# The build is not the test.  This image once built, started, reported itself
+# healthy, and reset every connection, because the process inside was bound to a
+# port nothing outside the container could reach.  So every run starts the image
+# it just built and talks to it from outside, and only a run that passes that
+# publishes anything.
+name: Image
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    # The build stage fetches a Lean toolchain and compiles the node.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Only for a push: a pull request from a fork has no business holding a
+      # token that can write packages, and does not need one to build.
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+            type=ref,event=pr
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: trust-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Prove it runs
+        run: |
+          set -euo pipefail
+          docker run -d --name node -p 127.0.0.1:8080:8080 \
+            -e TRUST_LOCAL=true -e NODE_NAME=ci trust-server:ci
+          for _ in $(seq 1 60); do
+            curl -sS -m 2 -o /dev/null http://127.0.0.1:8080/api/health && break || sleep 1
+          done
+
+          # Unprivileged, because a node that accepts POSTs from strangers
+          # should not be root even inside its own container.
+          echo "runs as: $(docker exec node id -u)"
+          test "$(docker exec node id -u)" != "0"
+
+          # Reachable *from outside the container*, which is the thing a health
+          # check inside it cannot tell you.
+          curl -sS --fail-with-body http://127.0.0.1:8080/api/health
+          echo
+
+          # It is a node, not merely a web server: §2's descriptor is what a
+          # peer reads before it will speak to it at all.
+          curl -sS --fail-with-body http://127.0.0.1:8080/api/federation | tee descriptor
+          echo
+          grep -q '"protocol":"trust/1"' descriptor
+
+          # The two subprocesses it cannot work without: gpg checks every
+          # signature it believes, curl reaches every peer.
+          docker exec node gpg --version | head -1
+          docker exec node curl --version | head -1
+
+          # The store is a real database on the volume, not an empty directory.
+          docker exec node sh -c 'test -s /data/store.db' && echo "store.db written"
+          docker rm -f node
+
+      - name: Publish
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
