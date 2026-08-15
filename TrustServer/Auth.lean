@@ -269,6 +269,31 @@ def consumeState (app : App) (state : String) : IO Bool := do
     return true
 
 /--
+What GitHub said, when what it said was no.
+
+The token endpoint refuses with `error` and `error_description` in the body and
+HTTP 200 in the status line, so the body is the only thing separating "that
+secret is wrong" from "that code was already spent" — and this used to discard
+it, leaving an operator with a message that named nothing they could act on.
+
+Nothing in a refusal is secret: the client secret travels in the request, never
+in the reply.  A body that is not JSON at all gets its length and a prefix
+rather than the whole of itself, because what answers with a page instead of an
+object is usually a proxy or a captive portal, and a page in a log helps nobody.
+-/
+private def githubComplaint (response : Trust.Net.Response) : String :=
+  match (Json.parse response.body).toOption with
+  | some json =>
+    let field (name : String) : Option String := (json.getObjValAs? String name).toOption
+    match field "error", field "error_description" with
+    | some e, some description => s!": {e} — {description}"
+    | some e, none => s!": {e}"
+    | none, _ => s!" (HTTP {response.status}, and no error in the JSON either)"
+  | none =>
+    s!" (HTTP {response.status}; the {response.body.length} bytes it answered are not JSON: " ++
+      s!"{(response.body.take 120).toString})"
+
+/--
 Exchange the code for a token, and ask GitHub who it belongs to.
 
 The second call goes to the GraphQL endpoint rather than to `GET /user`, and the
@@ -291,7 +316,7 @@ def exchangeCode (app : App) (code : String) : IO (Except String GitHubAccount) 
   | .ok response =>
     let some token := (Json.parse response.body).toOption.bind
       (·.getObjValAs? String "access_token" |>.toOption) |
-      return .error "GitHub did not return a token"
+      return .error s!"GitHub did not return a token{githubComplaint response}"
     let queryBody := Json.compress <| Json.mkObj [
       ("query", Json.str "query { viewer { databaseId login avatarUrl } }")]
     match ← Trust.Net.postJson "https://api.github.com/graphql" token queryBody policy with
