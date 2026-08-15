@@ -35,7 +35,7 @@
    "type": "git",
    "subDir": null,
    "scope": "",
-   "rev": "0407bf1ffe752c150892e2236957ea227a4fc413",
+   "rev": "1254a1239c88272f73f45aa786c8b8e47027b65a",
    "name": "trust",
    "manifestFile": "lake-manifest.json",
    "inputRev": "master",
