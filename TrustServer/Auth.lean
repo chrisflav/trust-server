@@ -276,10 +276,16 @@ HTTP 200 in the status line, so the body is the only thing separating "that
 secret is wrong" from "that code was already spent" — and this used to discard
 it, leaving an operator with a message that named nothing they could act on.
 
-Nothing in a refusal is secret: the client secret travels in the request, never
-in the reply.  A body that is not JSON at all gets its length and a prefix
-rather than the whole of itself, because what answers with a page instead of an
-object is usually a proxy or a captive portal, and a page in a log helps nobody.
+Nothing in a *refusal* is secret: the client secret travels in the request,
+never in the reply, and `error` with `error_description` is the whole of what
+GitHub says when it says no.
+
+A body that is not JSON is described and never quoted, and that restraint is
+load-bearing rather than fastidious.  The reply this cannot parse is most often
+a **successful** exchange in `application/x-www-form-urlencoded`, whose first
+field is the access token — so a message that echoed the body would write a live
+credential into the log, and into whatever the browser is shown.  The shape is
+what an operator needs, and the shape is sayable without the contents.
 -/
 private def githubComplaint (response : Trust.Net.Response) : String :=
   match (Json.parse response.body).toOption with
@@ -290,8 +296,12 @@ private def githubComplaint (response : Trust.Net.Response) : String :=
     | some e, none => s!": {e}"
     | none, _ => s!" (HTTP {response.status}, and no error in the JSON either)"
   | none =>
-    s!" (HTTP {response.status}; the {response.body.length} bytes it answered are not JSON: " ++
-      s!"{(response.body.take 120).toString})"
+    if response.body.startsWith "access_token=" || response.body.startsWith "error=" then
+      s!" (HTTP {response.status}: it answered form-encoded rather than JSON, which is what " ++
+        "GitHub does when the request does not ask for JSON.  A `trust` older than " ++
+        "chrisflav/trust#21 does not ask, so this node is built against one.)"
+    else
+      s!" (HTTP {response.status}: the {response.body.length} bytes it answered are not JSON)"
 
 /--
 Exchange the code for a token, and ask GitHub who it belongs to.

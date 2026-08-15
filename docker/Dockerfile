@@ -30,8 +30,26 @@ RUN elan toolchain install "$(cat lean-toolchain)" && elan default "$(cat lean-t
 
 # The manifest before the source, so that a change to the code does not refetch
 # `aftk`, `semantic_hash` and the rest.
+#
+# `check-build` and not `update`, and the difference is the whole reason this
+# comment is long.  `lake update` *re-resolves* every dependency to its
+# `inputRev` — `master`, for `trust` — and rewrites the manifest.  In a layer
+# that Docker caches on `lakefile.toml` and `lake-manifest.json`, neither of
+# which changes when `trust` does, that means the image is built against
+# whatever `master` happened to be the first time this layer was built, and
+# nothing in the repository says which commit that was.  A fix merged into core
+# then does not reach the image, the rebuild reports success, and the only
+# evidence is a symbol missing from the binary.
+#
+# `lake env true` resolves the workspace instead, which materialises exactly the
+# revisions the manifest names and updates nothing.  (`check-build` looked like
+# the honest spelling of "load the workspace" and fetches nothing at all, which
+# would have left this layer a no-op.)  So the dependency versions become a
+# committed fact, `lake update trust` followed by a commit is what a bump looks
+# like, and the manifest changing is what invalidates this layer — which is the
+# same event as the versions changing, rather than an unrelated one.
 COPY lakefile.toml lake-manifest.json ./
-RUN lake update --keep-toolchain || true
+RUN lake env true
 
 COPY . .
 RUN lake build trust-server
