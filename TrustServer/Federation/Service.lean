@@ -147,6 +147,23 @@ def exportBundle (app : App) (since : String) (limit : Nat) : IO Json := do
   let limit := max 1 (min limit app.config.policy.maxEntries)
   let certificates ← app.store.certificatesSince since limit
   let revocations ← app.store.revocationsSince since limit
+  -- §3.1: "A node **must not** export `attested` entries, and **must** discard
+  -- any it receives."  The receiving half is `Trust.Federation.acceptEntry`,
+  -- which refuses an entry that names no fingerprint; this is the sending half,
+  -- and it was missing — every unsigned assertion made through this node's own
+  -- web UI was leaving in a public bundle.  Nothing downstream could accept
+  -- one, so what it cost was not a forged entry but the difference between "we
+  -- do not export those" and "our peers throw them away for us".
+  --
+  -- Filtered out of `values` while `cursor` and `truncated` keep coming from
+  -- the unfiltered page: they describe how far the *store* was read, and a
+  -- receiver that resumed from a cursor shortened by filtering would re-read
+  -- rows for ever, or skip them.
+  let exportable (row : Row StoredCertificate) : Bool :=
+    match row.value with
+    | some cert => !cert.entry.signature.isEmpty
+    | none => true
+  let certificates := { certificates with rows := certificates.rows.filter exportable }
   let cursor :=
     if certificates.truncated && revocations.truncated then
       earlierCursor certificates.cursor revocations.cursor
@@ -476,14 +493,31 @@ def renderAnswer (app : App) (answer : Answer) : Json :=
   let me := ourUrl app
   let render (cert : StoredCertificate) : Json :=
     let mine := cert.fromPeer.isEmpty
+    -- §3.1's two assurances, read off the entry rather than assumed.
+    --
+    -- This said `"signed"` outright, on the reasoning that §3.1 lets nothing
+    -- else federate and nothing else is stored by this file.  The first half
+    -- holds; the second stopped holding when local publishing began writing
+    -- `attested` rows into the same store, and a locally attested certificate
+    -- has been answered for ever since as though a signature had been checked.
+    -- For a tool whose subject is what a reader can check, claiming a signature
+    -- that is not there is the one direction it must never be wrong in.
+    let signed := !cert.entry.signature.isEmpty
     Json.mkObj [
       ("claim", toJson cert.entry.claim),
       ("canonical", Json.str cert.entry.claim.canonical),
       ("signature", Json.str cert.entry.signature),
       ("key", Json.str cert.entry.key),
       ("fingerprint", Json.str cert.entry.fingerprint),
-      -- §3.1: nothing else federates, and nothing else is stored by this file.
-      ("assurance", Json.str "signed"),
+      ("assurance", Json.str (if signed then "signed" else "attested")),
+      -- §7.4 beside the hints, not instead of them: a reader wants a name to
+      -- show, and `Routes.certificateJson` puts one here, so an answer from
+      -- this path had better carry the same field under the same name.  For a
+      -- relayed entry it is a hint and `hintsVerified` says so.
+      ("issuer", Json.str cert.hints.issuer),
+      ("avatarUrl", Json.str ""),
+      ("keyVerifiedVia",
+        if cert.hints.keyVerifiedVia.isEmpty then Json.null else Json.str cert.hints.keyVerifiedVia),
       ("hints", renderHints cert.hints (if mine then me else "")),
       -- §4.4: a receiver must mark hints unverified, so they are marked here
       -- rather than left for a reader to remember.
@@ -492,7 +526,9 @@ def renderAnswer (app : App) (answer : Answer) : Json :=
         ("local", Json.bool mine),
         ("origin", Json.str (if cert.hints.origin.isEmpty then (if mine then me else "") else cert.hints.origin)),
         ("fromPeer", Json.str cert.fromPeer),
-        ("verifiedHere", Json.bool true),
+        -- There is no signature on an attested entry, so there was nothing for
+        -- this node to have applied §3.4 to.
+        ("verifiedHere", Json.bool signed),
         ("fetchedAt", if cert.fetchedMs == 0 then Json.null else Json.str (rfc3339OfMs cert.fetchedMs))])]
   Json.mkObj [
     ("certificates", Json.arr (answer.certificates.map render)),
