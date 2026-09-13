@@ -526,13 +526,25 @@ private def unfollowKey (app : App) (req : Request Body.Stream) :
 /--
 `GET /api/trusted?hasher=`.
 
-Every hash your trust list vouches for, as one flat set — what the frontend
-actually needs, since it already knows how to turn "these declarations are
-trusted" into graph semantics.
+Every hash you trust, as one flat set — what the frontend actually needs, since
+it already knows how to turn "these declarations are trusted" into graph
+semantics.
+
+Yourself included, and not by having to follow yourself: a certificate you
+published is a judgement you made, so it has to colour a graph and stop a
+dependency tree exactly where one you accepted from somebody else does.  Leaving
+it out made the one person whose judgements a reader is certain of the only
+person whose judgements did not count.
 
 Non-transitive by construction: the joins go one hop, so trusting somebody never
 silently enrols the people *they* trust.  Federation widens who you can hear
 from, not whom you trust.
+
+Each row says who asserted it as well as what they asserted, so that a client
+can tell a reader *by whom* something is trusted without asking a further
+question per declaration.  §4.4 applies to that name as it does everywhere else:
+`local` says whether this node authenticated the account or is repeating what a
+stranger's node typed, and the fingerprint is the part that carries weight.
 
 Withdrawals apply here too.  A trusted set that kept counting a certificate its
 issuer had taken back would be the one place the withdrawal did not arrive — and
@@ -543,7 +555,7 @@ private def trusted (app : App) (req : Request Body.Stream) : ContextAsync (Resp
   Auth.withIdentity app req fun identity => do
     let hasher := Auth.query req "hasher"
     let follows ← app.store.listFollows identity.login
-    let logins := (follows.filter (·.kind == "login")).map (·.target)
+    let logins := #[identity.login] ++ (follows.filter (·.kind == "login")).map (·.target)
     let keys := (follows.filter (·.kind == "key")).map (·.target.toLower)
     let mut seen : Std.HashMap String Unit := {}
     let mut out := #[]
@@ -564,7 +576,10 @@ private def trusted (app : App) (req : Request Body.Stream) : ContextAsync (Resp
       out := out.push (Json.mkObj [
         ("hash", Json.str claim.hash), ("hasher", Json.str claim.hasher),
         ("fingerprint", Json.str cert.entry.fingerprint),
-        ("asserted", Json.str claim.asserted)])
+        ("asserted", Json.str claim.asserted),
+        ("issuer", Json.str cert.hints.issuer),
+        ("local", Json.bool cert.isLocal),
+        ("mine", Json.bool (cert.isLocal && cert.hints.issuer == identity.login))])
     json Response.ok (Json.mkObj [("hashes", Json.arr out)])
 
 /--
