@@ -526,13 +526,25 @@ private def unfollowKey (app : App) (req : Request Body.Stream) :
 /--
 `GET /api/trusted?hasher=`.
 
-Every hash your trust list vouches for, as one flat set — what the frontend
-actually needs, since it already knows how to turn "these declarations are
-trusted" into graph semantics.
+Every hash you trust, as one flat set — what the frontend actually needs, since
+it already knows how to turn "these declarations are trusted" into graph
+semantics.
+
+Yourself included, and not by having to follow yourself: a certificate you
+published is a judgement you made, so it has to colour a graph and stop a
+dependency tree exactly where one you accepted from somebody else does.  Leaving
+it out made the one person whose judgements a reader is certain of the only
+person whose judgements did not count.
 
 Non-transitive by construction: the joins go one hop, so trusting somebody never
 silently enrols the people *they* trust.  Federation widens who you can hear
 from, not whom you trust.
+
+Each row says who asserted it as well as what they asserted, so that a client
+can tell a reader *by whom* something is trusted without asking a further
+question per declaration.  §4.4 applies to that name as it does everywhere else:
+`local` says whether this node authenticated the account or is repeating what a
+stranger's node typed, and the fingerprint is the part that carries weight.
 
 Withdrawals apply here too.  A trusted set that kept counting a certificate its
 issuer had taken back would be the one place the withdrawal did not arrive — and
@@ -545,26 +557,48 @@ private def trusted (app : App) (req : Request Body.Stream) : ContextAsync (Resp
     let follows ← app.store.listFollows identity.login
     let logins := (follows.filter (·.kind == "login")).map (·.target)
     let keys := (follows.filter (·.kind == "key")).map (·.target.toLower)
+    -- Your own keys, because a certificate of yours is yours wherever it is
+    -- standing.  §3.5's collision keeps the later assertion of a triple, peer
+    -- copies included, so a signed row made here can come back from a node it
+    -- was pushed to and stop being local — and then the one judgement a reader
+    -- is certain of would drop out of their own trusted set.  A fingerprint
+    -- registered to the account is something this node checked; `local` and a
+    -- name are not.
+    let mineKeys := (← app.store.keysForLogin identity.login).map (·.fingerprint.toLower)
     let mut seen : Std.HashMap String Unit := {}
     let mut out := #[]
     for cert in ← app.store.liveCertificates do
       let claim := cert.entry.claim
       if let some h := hasher then
         if claim.hasher != h then continue
-      let byKey := keys.contains cert.entry.fingerprint.toLower && !cert.entry.fingerprint.isEmpty
+      let fingerprint := cert.entry.fingerprint.toLower
+      let byKey := !fingerprint.isEmpty && keys.contains fingerprint
       -- A login is only meaningful for a row this node issued: an `issuer` hint
       -- on a federated entry is the sender's word and §4.4 forbids acting on it.
       let byLogin := cert.isLocal && logins.contains cert.hints.issuer
-      if !(byKey || byLogin) then continue
+      let mine := (cert.isLocal && cert.hints.issuer == identity.login)
+        || (!fingerprint.isEmpty && mineKeys.contains fingerprint)
+      if !(byKey || byLogin || mine) then continue
       if ← app.store.isRevoked cert.entry.fingerprint claim.hash claim.hasher claim.asserted then
         continue
-      let key := certificateKey cert.entry.fingerprint claim.hash claim.hasher
+      -- Keyed the way the store keys it.  An unsigned row has no fingerprint to
+      -- be identified by, and filing every one of them under the empty string
+      -- would report two accounts' assertions about the same content as one —
+      -- which, now that a row says who made it, would drop a voucher and could
+      -- answer with somebody else's name where the reader's own belongs.
+      let key :=
+        if cert.entry.fingerprint.isEmpty then
+          attestedKey cert.hints.issuer claim.hash claim.hasher
+        else certificateKey cert.entry.fingerprint claim.hash claim.hasher
       if seen.contains key then continue
       seen := seen.insert key ()
       out := out.push (Json.mkObj [
         ("hash", Json.str claim.hash), ("hasher", Json.str claim.hasher),
         ("fingerprint", Json.str cert.entry.fingerprint),
-        ("asserted", Json.str claim.asserted)])
+        ("asserted", Json.str claim.asserted),
+        ("issuer", Json.str cert.hints.issuer),
+        ("local", Json.bool cert.isLocal),
+        ("mine", Json.bool mine)])
     json Response.ok (Json.mkObj [("hashes", Json.arr out)])
 
 /--

@@ -684,6 +684,11 @@ private structure RouteFindings where
   expiredCookieStatus : Nat := 0
   trustKeysCount : Nat := 0
   trustedHashCount : Nat := 0
+  ownAttestedTrusted : Bool := false
+  ownTrustedRowMine : Bool := false
+  ownTrustedRowIssuer : String := ""
+  attestedVouchersListed : Nat := 0
+  attestedVouchersNamed : Bool := false
   badFingerprintStatus : Nat := 0
   unknownLoginStatus : Nat := 0
   unknownPathStatus : Nat := 0
@@ -940,11 +945,37 @@ private def runRoutes (root : System.FilePath) : IO RouteFindings := do
       let noSuchPerson ← request p1 "POST" "/api/trust-list/nobody" ""
       let list ← request p1 "GET" "/api/trust-list"
       let trusted ← request p1 "GET" "/api/trusted?hasher=semantic_hash/1"
+      let trustedRows := jArr (parsed trusted) "hashes"
+      -- `Foo.c` is alice's own, and unsigned: no key-follow can have brought it
+      -- in, so it is in the set exactly when her own judgements count.
+      let ownRow := trustedRows.find? (fun row => jStr row "hash" == claimC.hash)
       f := { f with
         trustKeysCount := if followed.status == 200 then (jArr (parsed list) "keys").size else 0
-        trustedHashCount := (jArr (parsed trusted) "hashes").size
+        trustedHashCount := trustedRows.size
+        ownAttestedTrusted := ownRow.isSome
+        ownTrustedRowMine := (ownRow.map (jBool · "mine")).getD false
+        ownTrustedRowIssuer := (ownRow.map (jStr · "issuer")).getD ""
         badFingerprintStatus := notAFingerprint.status
         unknownLoginStatus := noSuchPerson.status }
+
+      -- Two accounts asserting the same content are two judgements, and an
+      -- unsigned row has no fingerprint to tell them apart by.  `Foo.d` is
+      -- bob's, attested; carol attests the same claim, and bob follows her.
+      publicStore.putIdentity { login := "carol", githubId := 4712 }
+      let carolToken := "trust_" ++ (← freshToken)
+      publicStore.putSession { token := carolToken, id := "tok-2", kind := .api, login := "carol",
+                               name := "laptop" }
+      let _ ← request p2 "POST" "/api/certificates" (publishBody claimD)
+        #[("Authorization", s!"Bearer {carolToken}")]
+      let _ ← request p2 "POST" "/api/trust-list/carol" ""
+        #[("Authorization", s!"Bearer {bobToken}")]
+      let bobTrusted ← request p2 "GET" "/api/trusted?hasher=semantic_hash/1" ""
+        #[("Authorization", s!"Bearer {bobToken}")]
+      let bobRows := (jArr (parsed bobTrusted) "hashes").filter (fun row => jStr row "hash" == claimD.hash)
+      f := { f with
+        attestedVouchersListed := bobRows.size
+        attestedVouchersNamed :=
+          bobRows.any (jBool · "mine") && bobRows.any (fun row => jStr row "issuer" == "carol") }
 
       let missing ← request p1 "GET" "/api/nothing-here"
       let wrongMethod ← request p1 "GET" "/api/import"
@@ -1055,6 +1086,13 @@ private def routeTests (f : RouteFindings) : TestSeq :=
     group "trust lists" (
       test "a key can be followed" (f.trustKeysCount = 1) <|
       test "and what it vouches for becomes trusted" (f.trustedHashCount > 0) <|
+      test "a certificate you published yourself counts, without following yourself"
+        (f.ownAttestedTrusted = true) <|
+      test "and the row says whose judgement it was"
+        (f.ownTrustedRowMine = true && f.ownTrustedRowIssuer = "alice") <|
+      test "two accounts asserting the same content are two rows, not one"
+        (f.attestedVouchersListed = 2) <|
+      test "and each is named, yours as yours" (f.attestedVouchersNamed = true) <|
       test "something that is not a fingerprint is refused" (f.badFingerprintStatus = 400) <|
       test "and following nobody says so" (f.unknownLoginStatus = 404)) <|
     group "the router" (
