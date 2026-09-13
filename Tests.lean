@@ -687,6 +687,8 @@ private structure RouteFindings where
   ownAttestedTrusted : Bool := false
   ownTrustedRowMine : Bool := false
   ownTrustedRowIssuer : String := ""
+  attestedVouchersListed : Nat := 0
+  attestedVouchersNamed : Bool := false
   badFingerprintStatus : Nat := 0
   unknownLoginStatus : Nat := 0
   unknownPathStatus : Nat := 0
@@ -956,6 +958,25 @@ private def runRoutes (root : System.FilePath) : IO RouteFindings := do
         badFingerprintStatus := notAFingerprint.status
         unknownLoginStatus := noSuchPerson.status }
 
+      -- Two accounts asserting the same content are two judgements, and an
+      -- unsigned row has no fingerprint to tell them apart by.  `Foo.d` is
+      -- bob's, attested; carol attests the same claim, and bob follows her.
+      publicStore.putIdentity { login := "carol", githubId := 4712 }
+      let carolToken := "trust_" ++ (← freshToken)
+      publicStore.putSession { token := carolToken, id := "tok-2", kind := .api, login := "carol",
+                               name := "laptop" }
+      let _ ← request p2 "POST" "/api/certificates" (publishBody claimD)
+        #[("Authorization", s!"Bearer {carolToken}")]
+      let _ ← request p2 "POST" "/api/trust-list/carol" ""
+        #[("Authorization", s!"Bearer {bobToken}")]
+      let bobTrusted ← request p2 "GET" "/api/trusted?hasher=semantic_hash/1" ""
+        #[("Authorization", s!"Bearer {bobToken}")]
+      let bobRows := (jArr (parsed bobTrusted) "hashes").filter (fun row => jStr row "hash" == claimD.hash)
+      f := { f with
+        attestedVouchersListed := bobRows.size
+        attestedVouchersNamed :=
+          bobRows.any (jBool · "mine") && bobRows.any (fun row => jStr row "issuer" == "carol") }
+
       let missing ← request p1 "GET" "/api/nothing-here"
       let wrongMethod ← request p1 "GET" "/api/import"
       f := { f with
@@ -1069,6 +1090,9 @@ private def routeTests (f : RouteFindings) : TestSeq :=
         (f.ownAttestedTrusted = true) <|
       test "and the row says whose judgement it was"
         (f.ownTrustedRowMine = true && f.ownTrustedRowIssuer = "alice") <|
+      test "two accounts asserting the same content are two rows, not one"
+        (f.attestedVouchersListed = 2) <|
+      test "and each is named, yours as yours" (f.attestedVouchersNamed = true) <|
       test "something that is not a fingerprint is refused" (f.badFingerprintStatus = 400) <|
       test "and following nobody says so" (f.unknownLoginStatus = 404)) <|
     group "the router" (
